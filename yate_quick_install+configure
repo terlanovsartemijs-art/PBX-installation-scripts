@@ -1,0 +1,170 @@
+# Confirm Debian version — package names differ between 11 and 12
+cat /etc/debian_version
+lsb_release -a
+
+# Check available RAM — build needs at least 2 GB
+free -h
+
+# Check CPU cores — used for -j flag later
+nproc
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y \
+  build-essential g++ autoconf automake libtool pkg-config
+
+sudo apt install -y \
+  libasound2-dev \
+  libgsm1-dev \
+  libspeex-dev libspeexdsp-dev \
+  libpcre3-dev \
+  libssl-dev \
+  libsctp-dev \
+  libsqlite3-dev \
+  libspandsp-dev \
+  libsrtp2-dev \
+  libsndfile1-dev \
+  libxml2-dev \
+  libcap-dev \
+  libpam0g-dev
+
+# Only if you passed --with-mysql or --with-pgsql to ./configure
+sudo apt install -y \
+  default-libmysqlclient-dev \
+  libpq-dev \
+  unixodbc-dev
+
+# Only if running on hardware with audio I/O
+sudo apt install -y \
+  libjack-jackd2-dev \
+  portaudio19-dev
+
+# libopenh323-dev — NOT in Debian 12 default repos
+
+# Skip unless H.323 support is required
+
+# sudo apt install -y libopenh323-dev libpt-dev
+
+# libopenr2-dev — MFC/R2 signaling, optional
+sudo apt install -y libopenr2-dev
+
+# libpri-dev — Digium PRI cards, optional
+sudo apt install -y libpri-dev
+
+# libss7-dev — may not be in repos, build from source if needed
+
+# sudo apt install -y libss7-dev
+
+# libilbc-dev — check exact name on your Debian version
+
+apt-cache search ilbc
+sudo apt install -y libilbc-dev
+
+# libiksemel-dev — may require building from source on Debian 12
+
+apt-cache search iksemel
+# sudo apt install -y libiksemel-dev
+
+# libjsoncpp-dev
+sudo apt install -y libjsoncpp-dev
+
+sudo apt install -y \
+  libopus-dev \
+  libcodec2-dev \
+  libmpg123-dev \
+  libmp3lame-dev
+
+mkdir -p ~/src && cd ~/src
+
+# Primary source — yate.null.ro is sometimes unreliable
+wget http://yate.null.ro/tarballs/yate6/yate-6.4.1-1.tar.gz
+
+# If wget fails, try the SourceForge mirror
+wget https://sourceforge.net/projects/yate/files
+
+
+/yate/6.4.1-1/yate-6.4.1-1.tar.gz
+
+# Verify download integrity
+ls -lh yate-6.4.1-1.tar.gz
+file yate-6.4.1-1.tar.gz
+
+tar -xzf yate-6.4.1-1.tar.gz
+cd yate
+
+./autogen.sh
+
+# Configure and save output for review
+./configure \
+  --prefix=/usr/local \
+  --with-pgsql \
+  --with-mysql \
+  2>&1 | tee ~/src/configure.log
+
+# Check which modules got enabled / disabled
+grep -E "(yes|no|not found|disabled)" ~/src/configure.log | tail -60
+
+# Use -j2 on VMs with less than 2 GB RAM to avoid OOM
+# Use -j$(nproc) if you have 4 GB+ RAM
+make -j2 2>&1 | tee ~/src/build.log
+
+
+sudo make install
+sudo ldconfig
+
+# Verify the binary was installed
+/usr/local/bin/yate --version
+
+
+# Copy default config
+sudo mkdir -p /etc/yate
+sudo cp -r conf.d /etc/yate/
+
+# Create log directory (MISSING from original script)
+sudo mkdir -p /var/log/yate
+
+
+# Create system user
+sudo useradd -r -s /bin/false -d /var/run/yate yate
+
+# Set permissions on both config paths
+sudo chown -R yate:yate /usr/local/etc/yate
+sudo chown -R yate:yate /etc/yate
+sudo chown -R yate:yate /var/log/yate
+
+sudo tee /etc/systemd/system/yate.service > /dev/null <<'EOF'
+[Unit]
+Description=YATE Telephony Engine
+After=network.target
+
+[Service]
+Type=forking
+User=yate
+Group=yate
+ExecStart=/usr/local/bin/yate -c /etc/yate/conf.d -d -l /var/log/yate/yate.log
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable yate
+sudo systemctl start yate
+
+# Check status and logs
+sudo systemctl status yate
+sudo journalctl -u yate -f
+
+# Confirm process is running
+ps aux | grep yate
+
+# Check version
+/usr/local/bin/yate --version
+
+# Tail the log
+tail -f /var/log/yate/yate.log
+
+# Test admin console — requires credentials set in yate.conf
+# See [listener] and [auth] sections before connecting
+telnet localhost 5038
