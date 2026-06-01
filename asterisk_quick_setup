@@ -1,0 +1,38 @@
+sudo apt update && sudo apt upgrade -y
+
+sudo apt install -y build-essential wget curl git libssl-dev uuid-dev libjansson-dev
+
+cd /usr/src
+sudo wget https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-20-current.tar.gz
+sudo tar xvf asterisk-20-current.tar.gz
+cd $(ls -d asterisk-20*/ | head -1)
+
+# optional: mp3 support
+sudo contrib/scripts/get_mp3_source.sh
+
+# install remaining asterisk prereqs & configure
+sudo contrib/scripts/install_prereq install
+sudo ./configure
+
+# optional: menuselect opens a TUI to pick modules — skip for defaults
+# sudo make menuselect
+
+# compile using all cpu cores
+sudo make -j$(nproc)
+
+
+# swap basic-pbx for samples if you want the big commented reference config
+sudo make install
+sudo make basic-pbx
+sudo make config
+sudo ldconfig
+
+# open firewall — SIP signalling + RTP audio (one-way audio if you skip this)
+sudo ufw allow 5060/udp
+sudo ufw allow 5060/tcp
+sudo ufw allow 10000:20000/udp
+
+# enable service & connect to cli (exit with 'exit', not ctrl+c)
+sudo systemctl enable asterisk
+sudo systemctl start asterisk
+sudo asterisk -rvv
