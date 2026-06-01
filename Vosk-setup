@@ -1,0 +1,282 @@
+PART 1 — Install dependencies
+1. Update apt and install system tools:
+bashsudo apt-get update
+sudo apt-get install -y python3 python3-pip sox ffmpeg wget unzip
+
+2. Install Python packages:
+bashsudo pip install vosk watchdog --break-system-packages
+
+3. Verify vosk installed correctly:
+bashpython3 -c "import vosk; print('vosk OK')"
+Should print vosk OK. If it errors, re-run step 2.
+
+
+
+PART 2 — Download the Vosk model
+
+4. Create the models directory:
+bashsudo mkdir -p /opt/vosk-models
+cd /opt/vosk-models
+
+5. Download a model. Pick one:
+
+English large (1.8GB, best accuracy — recommended for production):
+
+bashsudo wget https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip
+sudo unzip vosk-model-en-us-0.22.zip
+
+English small (40MB, fast — good for testing first):
+
+bashsudo wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+sudo unzip vosk-model-small-en-us-0.15.zip
+
+Latvian:
+
+bashsudo wget https://alphacephei.com/vosk/models/vosk-model-lv-0.1.zip
+sudo unzip vosk-model-lv-0.1.zip
+
+
+6. Give the asterisk user ownership of the models folder:
+bashsudo chown -R asterisk:asterisk /opt/vosk-models
+
+PART 3 — Create directories
+7. Create the recordings and transcripts folders:
+bashsudo mkdir -p /var/spool/asterisk/recordings
+sudo mkdir -p /var/spool/asterisk/transcripts
+
+
+8. Set ownership:
+bashsudo chown asterisk:asterisk /var/spool/asterisk/recordings
+sudo chown asterisk:asterisk /var/spool/asterisk/transcripts
+
+9. Create the log file:
+bashsudo touch /var/log/asterisk/transcribe_agi.log
+sudo chown asterisk:asterisk /var/log/asterisk/transcribe_agi.log
+
+PART 4 — Write the AGI transcription script
+10. Open a new file:
+bashsudo nano /var/lib/asterisk/agi-bin/transcribe_agi.py
+
+11. Paste in this entire script:
+python#!/usr/bin/env python3
+import sys
+import os
+import json
+import wave
+import subprocess
+import logging
+import time
+
+# ── Edit these if needed ──────────────────────────────────────────────────────
+MODEL_PATH  = "/opt/vosk-models/vosk-model-en-us-0.22"   # change to match your model folder name
+TRANSCRIPTS = "/var/spool/asterisk/transcripts"
+LOG_PATH    = "/var/log/asterisk/transcribe_agi.log"
+AUTO_CONVERT = True   # True = resample audio from 8kHz to 16kHz (required for SIP calls)
+# ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stderr),
+    ]
+)
+log = logging.getLogger(__name__)
+
+
+def wait_for_file(path, timeout=30, poll=0.5):
+    deadline = time.time() + timeout
+    last_size = -1
+    while time.time() < deadline:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if size > 0 and size == last_size:
+                return True
+            last_size = size
+        time.sleep(poll)
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def convert_to_16k(src, dst):
+    sox = subprocess.run(
+        ["sox", src, "-r", "16000", "-c", "1", "-b", "16", dst],
+        capture_output=True
+    )
+    if sox.returncode == 0:
+        log.info("Converted with sox → %s", dst)
+        return True
+    ffmpeg = subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", dst],
+        capture_output=True
+    )
+    if ffmpeg.returncode == 0:
+        log.info("Converted with ffmpeg → %s", dst)
+        return True
+    log.error("Both sox and ffmpeg failed")
+    return False
+
+
+def transcribe(wav_path):
+    try:
+        import vosk
+    except ImportError:
+        log.error("vosk not installed")
+        return None
+
+    if not os.path.isdir(MODEL_PATH):
+        log.error("Model not found at %s", MODEL_PATH)
+        return None
+
+    log.info("Loading model...")
+    model = vosk.Model(MODEL_PATH)
+    log.info("Model loaded.")
+
+    work_path = wav_path
+    tmp_path  = None
+
+    if AUTO_CONVERT:
+        tmp_path = wav_path.replace(".wav", "_16k.wav")
+        if convert_to_16k(wav_path, tmp_path):
+            work_path = tmp_path
+        else:
+            tmp_path = None
+
+    try:
+        wf = wave.open(work_path, "rb")
+    except Exception as e:
+        log.error("Cannot open wav: %s", e)
+        return None
+
+    rec = vosk.KaldiRecognizer(model, wf.getframerate())
+    rec.SetWords(True)
+
+    parts = []
+    while True:
+        data = wf.readframes(4000)
+        if not data:
+            break
+        if rec.AcceptWaveform(data):
+            r = json.loads(rec.Result())
+            if r.get("text"):
+                parts.append(r["text"])
+
+    r = json.loads(rec.FinalResult())
+    if r.get("text"):
+        parts.append(r["text"])
+
+    wf.close()
+    if tmp_path and os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    return " ".join(parts).strip()
+
+
+def main():
+    if len(sys.argv) < 2:
+        log.error("Usage: transcribe_agi.py <recording.wav>")
+        sys.exit(1)
+
+    wav_path = sys.argv[1]
+    log.info("Called for: %s", wav_path)
+
+    if not wait_for_file(wav_path):
+        log.error("File not ready after timeout: %s", wav_path)
+        sys.exit(1)
+
+    log.info("File ready (%d bytes), transcribing...", os.path.getsize(wav_path))
+    text = transcribe(wav_path)
+
+    if text is None:
+        log.error("Transcription failed.")
+        sys.exit(1)
+
+    os.makedirs(TRANSCRIPTS, exist_ok=True)
+    base     = os.path.splitext(os.path.basename(wav_path))[0]
+    txt_path = os.path.join(TRANSCRIPTS, base + ".txt")
+
+    with open(txt_path, "w") as f:
+        f.write((text if text else "[no speech detected]") + "\n")
+
+    log.info("Saved → %s", txt_path)
+    log.info("Done: '%s'", (text[:80] + "...") if len(text) > 80 else text)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+        with open("/tmp/agi_crash.log", "a") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write(traceback.format_exc())
+        log.exception("Unhandled exception — see /tmp/agi_crash.log")
+        sys.exit(1)
+
+Save and exit: Ctrl+O → Enter → Ctrl+X
+12. Make it executable and set ownership:
+bashsudo chmod +x /var/lib/asterisk/agi-bin/transcribe_agi.py
+sudo chown asterisk:asterisk /var/lib/asterisk/agi-bin/transcribe_agi.py
+
+13. Test that vosk works as the asterisk user:
+bashsudo -u asterisk python3 -c "import vosk; print('vosk OK as asterisk user')"
+Should print vosk OK as asterisk user.
+
+PART 5 — Configure the Asterisk dialplan
+14. Open your extensions.conf:
+bashsudo nano /etc/asterisk/extensions.conf
+
+15. Add this sub-context (anywhere in the file, e.g. at the bottom):
+[sub-record]
+exten => s,1,NoOp(Recording call ${UNIQUEID})
+ same => n,Set(RECFILE=/var/spool/asterisk/recordings/${STRFTIME(${EPOCH},,%Y-%m-%d_%H-%M-%S)}_${CALLERID(num)}.wav)
+ same => n,MixMonitor(${RECFILE})
+ same => n,Return()
+
+16. In the context where your calls are handled (e.g. [internal-routing]), add two things:
+First, call the recording sub at the start of each call:
+same => n,GoSub(sub-record,s,1)
+Second, add a hangup handler that triggers transcription when the call ends:
+exten => h,1,NoOp(Hangup — transcribing ${RECFILE})
+ same => n,System(/var/lib/asterisk/agi-bin/transcribe_agi.py ${RECFILE} &)
+
+Note: The h extension must be in the same context where the call actually ends
+(where Dial() lives), not inside sub-record.
+
+Save and exit: Ctrl+O → Enter → Ctrl+X
+
+17. Reload the dialplan:
+bashsudo asterisk -rx "dialplan reload"
+
+18. Verify the dialplan loaded correctly:
+bashsudo asterisk -rx "dialplan show sub-record"
+Should show your sub-record context with the MixMonitor line.
+
+PART 6 — Test it
+19. Open the log in one terminal to watch live:
+bashsudo tail -f /var/log/asterisk/transcribe_agi.log
+
+
+20. Make a call from one softphone to another, talk for a few seconds, hang up.
+
+21. Within a few seconds you should see in the log:
+INFO  Called for: /var/spool/asterisk/recordings/2026-06-01_14-23-07_101.wav
+INFO  File ready (XXXXX bytes), transcribing...
+INFO  Model loaded.
+INFO  Converted with sox → ...
+INFO  Saved → /var/spool/asterisk/transcripts/2026-06-01_14-23-07_101.txt
+INFO  Done: 'hello can you hear me...'
+
+22. Check the transcript file:
+bashsudo ls -lt /var/spool/asterisk/transcripts/
+sudo cat /var/spool/asterisk/transcripts/<filename>.txt
+
+Switching to a different model later
+1. Download the new model (see step 5 above for URLs).
+2. Edit one line in the script:
+bashsudo nano /var/lib/asterisk/agi-bin/transcribe_agi.py
+Change MODEL_PATH at the top to the new folder name, e.g.:
+pythonMODEL_PATH = "/opt/vosk-models/vosk-model-lv-0.1"
+No restart needed — takes effect on the next call.
+
